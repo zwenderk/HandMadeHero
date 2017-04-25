@@ -15,30 +15,55 @@ typedef uint16_t uint16;
 typedef uint32_t uint32;
 typedef uint64_t uint64;
 
-//TODO(casey): Esto es global por ahora
-global_variable bool Running;
+struct win32_offscreen_buffer
+{
+    BITMAPINFO Info; // Estructura que define las dimensiones y color de un DIB
+    void *Memory;
+    int Width;
+    int Height;
+    int Pitch;
+    //int BytesPerPixel;
+};
 
-global_variable BITMAPINFO BitmapInfo; // Estructura que define las dimensiones y color de un DIB
-global_variable void *BitmapMemory;
-global_variable int BitmapWidth;
-global_variable int BitmapHeight;
-global_variable int BytesPerPixel = 4;
+//TODO(casey): Esto es global por ahora
+global_variable bool GlobalRunning;
+global_variable win32_offscreen_buffer GlobalBackbuffer;
+
+struct win32_window_dimension
+{
+    int Width;
+    int Height;
+};
+
+win32_window_dimension
+Win32GetWindowDimension(HWND Window)
+{
+    win32_window_dimension Result;
+
+    RECT ClientRect;
+    GetClientRect(Window, &ClientRect);// Recupera las coordenadas de un área de cliente de ventana
+    Result.Width = ClientRect.right - ClientRect.left;
+    Result.Height = ClientRect.bottom - ClientRect.top;
+
+    return(Result);
+}
+
+
+
 
 internal void
-RenderWeirGradient(int XOffset, int YOffset)
+RenderWeirGradient(win32_offscreen_buffer Buffer, int XOffset, int YOffset)
 {
-    int Width = BitmapWidth;
-    int Height = BitmapHeight;
+    // TODO(casey): Let's see what the optimizer does
 
-    int Pitch = Width*BytesPerPixel;
-    uint8 *Row = (uint8 *)BitmapMemory;
+    uint8 *Row = (uint8 *)Buffer.Memory;
     for (int Y = 0;
-    Y < BitmapHeight;
+    Y < Buffer.Height;
         ++Y)
     {
         uint32 *Pixel = (uint32 *)Row;
         for (int X = 0;
-        X < BitmapWidth;
+        X < Buffer.Width;
             ++X)
         {
             /*
@@ -46,94 +71,83 @@ RenderWeirGradient(int XOffset, int YOffset)
 
             Pixel in memory: BB GG RR xx
             Register:        xx RR GG BB
-
-
             LITTLE ENDIAN ARCHITECTURE 0x xxBBGGRR
             */
 
             uint8 Blue = (X + XOffset);
             uint8 Green = (Y + YOffset);
 
-
             *Pixel++ = ((Green << 8) | Blue);
-
         }
-        Row += Pitch;
+        Row += Buffer.Pitch; // Buffer.Pitch son los bytes horizontales de la imagen
     }
 }
 
 // Un mapa de bits independiente del dispositivo (DIB) contiene una
 // tabla de colores de píxeles de color RGB
 internal void
-Win32ResizeDIBSection(int Width, int Height)
+Win32ResizeDIBSection(win32_offscreen_buffer *Buffer, int Width, int Height)
 {
     //TODO(casey): Bulletproof this.
     // Maybe don't free first, free after, then free first if that fails.
 
-    if (BitmapMemory)
+    if (Buffer->Memory)
     {
         VirtualFree( // Libera memória
-            BitmapMemory, // puntero a la memoria a liberar 
+            Buffer->Memory, // puntero a la memoria a liberar 
             0, // tamaño en bytes
             MEM_RELEASE); // Tipo de operación
     }
 
-    //if (BitmapHandle)
-    //{
-    //    DeleteObject(BitmapHandle);
-    //}
+    Buffer->Width = Width;
+    Buffer->Height = Height;
+    int BytesPerPixel = 4;
 
-    //if(!BitmapDeviceContext)
-    //{
-    // crea un contexto de dispositivo de memoria (DC) compatible con el dispositivo especificado
-    // Si el manejador es NULL, crea un DC de memoria compatible con la pantalla actual de la aplicación
-    // TODO(casey): Should we recreate these under certain special circunstances
-    //   BitmapDeviceContext = CreateCompatibleDC(0); 
-    //}
+    // NOTE(casey): When the biHeight field is negative, this is the clue to
+    // Windows to treat this bitmap as top-down, not bottom-up, meaning that
+    // the first three bytes of the image are the color for the top left pixel
+    // in the bitmap, not the bottom left!
 
-    BitmapWidth = Width;
-    BitmapHeight = Height;
+    Buffer->Info.bmiHeader.biSize = sizeof(Buffer->Info.bmiHeader); // Número de bytes requeridos por la estructura
+    Buffer->Info.bmiHeader.biWidth = Buffer->Width; // ancho del bitmap
+    Buffer->Info.bmiHeader.biHeight = -Buffer->Height; // alto
+    Buffer->Info.bmiHeader.biPlanes = 1; // número de planos del dispositivo de destino
+    Buffer->Info.bmiHeader.biBitCount = 32; // número de bits por pixel
+    Buffer->Info.bmiHeader.biCompression = BI_RGB;// Tipo de comprensión del bitmap (jpeg,png,rle,rgb no comprimido)
 
-    BitmapInfo.bmiHeader.biSize = sizeof(BitmapInfo.bmiHeader); // Número de bytes requeridos por la estructura
-    BitmapInfo.bmiHeader.biWidth = BitmapWidth; // ancho del bitmap
-    BitmapInfo.bmiHeader.biHeight = -BitmapHeight; // alto
-    BitmapInfo.bmiHeader.biPlanes = 1; // número de planos del dispositivo de destino
-    BitmapInfo.bmiHeader.biBitCount = 32; // número de bits por pixel
-    BitmapInfo.bmiHeader.biCompression = BI_RGB;// Tipo de comprensión del bitmap (jpeg,png,rle,rgb no comprimido)
+                                                  //NOTE(casey): Thank you to Cris Hecker of Spy Party fame
+                                                  // for clarifyng the deal with StretchDIBits and BitBlt!
+                                                  // No more DC for us.
 
-                                                //NOTE(casey): Thank you to Cris Hecker of Spy Party fame
-                                                // for clarifyng the deal with StretchDIBits and BitBlt!
-                                                // No more DC for us.
+    int BitmapMemorySize = (Buffer->Width*Buffer->Height)*BytesPerPixel;
 
-    int BitmapMemorySize = (BitmapWidth*BitmapHeight)*BytesPerPixel;
-
-    BitmapMemory = VirtualAlloc(// Reserva con ceros una región de páginas de memoria.
+    Buffer->Memory = VirtualAlloc(// Reserva con ceros una región de páginas de memoria.
         0, // Dirección de inicio 0 -> lo determina el sistema
         BitmapMemorySize, // Tamaño de la región en bytes, si es 0 se redondea a la siguiente página
         MEM_COMMIT, // Tipo de memoria
         PAGE_READWRITE); // Protección de la memoria
 
-    RenderWeirGradient(0, 0);
+    Buffer->Pitch = Width*BytesPerPixel;
+    //TODO(casey): Probably clear this to black
+
+
 }
 
 internal void
-Win32UpdateWindow(HDC DeviceContext, RECT *ClientRect, int X, int Y, int Width, int Height)
+Win32DisplayBufferInWindow(HDC DeviceContext,
+    int WindowWidth, int WindowHeight,
+    win32_offscreen_buffer Buffer,
+    int X, int Y, int Width, int Height)
 {
-    /*
-
-    */
-    int WindowWidth = ClientRect->right - ClientRect->left;
-    int WindowHeight = ClientRect->bottom - ClientRect->top;
-
+    //TODO(casey): Aspect ratio correction
+    //TODO(casey): Play with stretch modes
     // copia los datos de color de un rectángulo de píxeles de una imagen de DIB,
     // JPEG o PNG en el rectángulo de destino especificado
-    StretchDIBits(DeviceContext,
-        //X, Y, Width, Height, // Medidas rectángulo de destino
-        //X, Y, Width, Height, // Medidas rectángulo de origen
-        0, 0, BitmapWidth, BitmapHeight, // Medidas rectángulo de destino
-        0, 0, WindowWidth, WindowHeight, // Medidas rectángulo de origen
-        BitmapMemory, // Puntero a imagen en un arreglo de bytes
-        &BitmapInfo, // Puntero a una estructura BITMAPINFO con información de DIB
+    StretchDIBits(DeviceContext, // DC que recibirá los datos
+        0, 0, WindowWidth, WindowHeight, // Medidas rectángulo de destino
+        0, 0, Buffer.Width, Buffer.Height, // Medidas rectángulo de origen
+        Buffer.Memory, // Puntero a imagen en un arreglo de bytes
+        &Buffer.Info, // Puntero a una estructura BITMAPINFO con información de DIB
         DIB_RGB_COLORS, // Paleta de colores
         SRCCOPY); // Raster Operation, indica como serán combinados los pixels (Copia en este caso)
 }
@@ -151,18 +165,15 @@ Win32MainWindowCallback( // Aquí es donde se procesan todos los mensajes que se 
     {
     case WM_SIZE:
     {
-        RECT ClientRect;
-        GetClientRect(Window, &ClientRect);// Recupera las coordenadas de un área de cliente de ventana
-        int Width = ClientRect.right - ClientRect.left;
-        int Heigh = ClientRect.bottom - ClientRect.top;
-        Win32ResizeDIBSection(Width, Heigh);
+        //win32_window_dimension Dimension = Win32GetWindowDimension(Window);
+        //Win32ResizeDIBSection(&GlobalBackbuffer, Dimension.Width, Dimension.Height); // Aqui el sistema rellena GlobalBackbuffer
 
     }break;
 
     case WM_CLOSE:
     {
         //TODO(casey): ¿Manejar esto con un mensaje al usuario?
-        Running = false;
+        GlobalRunning = false;
         OutputDebugStringA("WM_CLOSE\n");
     }break;
 
@@ -174,36 +185,27 @@ Win32MainWindowCallback( // Aquí es donde se procesan todos los mensajes que se 
     case WM_DESTROY:
     {
         //TODO(casey): ¿Manejar esto como un error - recrear ventana?
-        Running = false;
+        GlobalRunning = false;
         OutputDebugStringA("WM_DESTROY\n");
     }break;
 
     case WM_PAINT:
     {
+        OutputDebugStringA("WM_PAINT\n");
         PAINTSTRUCT Paint;
         HDC DeviceContext = BeginPaint( // Prepara la ventana para pintar y rellena la estructura PAINTSTRUCT
             Window, // Manejador de ventana
-            &Paint); // estructura PAINTSTRUCT
+            &Paint); // estructura PAINTSTRUCT que se devuelve rellena
 
         int X = Paint.rcPaint.left;
         int Y = Paint.rcPaint.top;
         int Width = Paint.rcPaint.right - Paint.rcPaint.left;
         int Height = Paint.rcPaint.bottom - Paint.rcPaint.top; // estructura RECT en estructura PAINTSTRUCT
 
-        RECT ClientRect;
-        GetClientRect(Window, &ClientRect);// Recupera las coordenadas de un área de cliente de ventana
-        Win32UpdateWindow(DeviceContext, &ClientRect, X, Y, Width, Height);
-        /*local_persist DWORD Operation = WHITENESS; // color asociado con el índice 1 en la paleta física. (blanco)
-        //pinta el rectángulo especificado usando el brush seleccionado en el contexto de dispositivo
-        PatBlt(DeviceContext, X, Y, Width, Height, Operation);
-        if (Operation == WHITENESS)
-        {
-        Operation = BLACKNESS;
-        }
-        else
-        {
-        Operation = WHITENESS;
-        }*/
+        win32_window_dimension Dimension = Win32GetWindowDimension(Window);
+        Win32DisplayBufferInWindow(DeviceContext, Dimension.Width, Dimension.Height,
+            GlobalBackbuffer, X, Y, Width, Height);
+
 
         EndPaint(Window, &Paint); // Fin de pintar ventana
 
@@ -225,10 +227,13 @@ WinMain(HINSTANCE Instance,
     LPSTR CommandLine,
     int ShowCode)
 {
-    WNDCLASS WindowClass = {};
 
-    // TODO(casey): Probar si HREDRAW/VREDRAW/OWNDC todavía importan
-    WindowClass.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW; // Estilos de clase (CS_*) que no debe confundirse con estilos de ventanas (WS_*) 
+
+    WNDCLASS WindowClass = {};
+    //win32_window_dimension Dimension = Win32GetWindowDimension(Window);
+    Win32ResizeDIBSection(&GlobalBackbuffer, 1280, 720); // Aqui el sistema rellena GlobalBackbuffer
+
+    WindowClass.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC; // Estilos de clase (CS_*) que no debe confundirse con estilos de ventanas (WS_*) 
     WindowClass.lpfnWndProc = Win32MainWindowCallback; // Puntero al procedimiento de ventana para esta clase de ventana.
     WindowClass.hInstance = Instance;
     // WindowClass.hIcon;
@@ -253,13 +258,22 @@ WinMain(HINSTANCE Instance,
                 0);
         if (Window)
         {
+
+            // NOTE(casey): Since we specified CS_OWNDC, we can just
+            // get one device context and use it forever because we
+            // are not sharing it with anyone.
+            // Recupera un identificador para un contexto de dispositivo (DC) para una ventana o para toda la pantalla
+            HDC DeviceContext = GetDC(Window);
+
             int XOffset = 0;
             int YOffset = 0;
-            Running = true;
-            while (Running)
-            {
 
+
+            GlobalRunning = true;
+            while (GlobalRunning)
+            {
                 MSG Message;
+
                 while (PeekMessage( // Despacha mensajes entrantes, y recupera el mensaje (si existe).
                     &Message, // Un puntero a estructura MSG
                     0, 0, 0,
@@ -267,25 +281,24 @@ WinMain(HINSTANCE Instance,
                 {
                     if (Message.message == WM_QUIT)
                     {
-                        Running = false;
+                        GlobalRunning = false;
                     }
 
                     TranslateMessage(&Message); // traduce mensajes con teclas virtuales, en mensajes con carácteres
                     DispatchMessage(&Message);
                 }
-                RenderWeirGradient(XOffset, YOffset); // Colorea pixels directamente
+                RenderWeirGradient(GlobalBackbuffer, XOffset, YOffset); // Colorea pixels directamente
 
-                                                      // Recupera un identificador para un contexto de dispositivo (DC) para una ventana o para toda la pantalla
-                HDC DeviceContext = GetDC(Window);
-                RECT ClientRect;
-                GetClientRect(Window, &ClientRect);// Recupera las coordenadas de un área de cliente de ventana
-                int WindowWidth = ClientRect.right - ClientRect.left;
-                int WindowHeight = ClientRect.bottom - ClientRect.top;
 
-                Win32UpdateWindow(DeviceContext, &ClientRect, 0, 0, WindowWidth, WindowHeight);
-                ReleaseDC(Window, DeviceContext);
+
+                win32_window_dimension Dimension = Win32GetWindowDimension(Window);
+                Win32DisplayBufferInWindow(DeviceContext, Dimension.Width, Dimension.Height,
+                    GlobalBackbuffer,
+                    0, 0, Dimension.Width, Dimension.Height);
+
 
                 ++XOffset;
+                YOffset += 2;
             }
         }
         else
